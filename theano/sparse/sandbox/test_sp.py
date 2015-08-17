@@ -12,6 +12,7 @@ import scipy.sparse
 from scipy.signal import convolve2d
 import scipy.sparse as sparse
 import numpy
+from six.moves import xrange
 
 from theano import function, tensor
 import theano
@@ -24,6 +25,7 @@ from theano.sparse.tests.test_basic import sparse_random_inputs
 
 
 class TestSP(unittest.TestCase):
+    @attr('slow')
     def test_convolution(self):
 #        print '\n\n*************************************************'
 #        print '           TEST CONVOLUTION'
@@ -218,6 +220,7 @@ class TestSP(unittest.TestCase):
 #            print 'Theano processing time: ', ttot
         # profmode.print_summary()
 
+    @attr('slow')
     def test_multilayer_sparse(self):
         # fixed parameters
         bsize = 10     # batch size

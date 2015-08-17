@@ -1,3 +1,4 @@
+from __future__ import print_function
 import copy
 import os
 import logging
@@ -6,13 +7,212 @@ _logger = logging.getLogger(__name__)
 import theano
 from theano import Apply
 from theano import tensor
-from theano.compat.six import StringIO
+from six.moves import StringIO, reduce
 from theano.sandbox.cuda.type import CudaNdarrayType
 from theano.sandbox.cuda import GpuOp
 from theano.sandbox.cuda.basic_ops import (as_cuda_ndarray_variable,
                                            gpu_contiguous)
 from theano.tensor import as_tensor_variable
 
+class BatchedDotOp(GpuOp):
+
+    __props__ = ()
+
+    def make_node(self, inp1, inp2):
+        inp1 = gpu_contiguous(as_cuda_ndarray_variable(inp1))
+        inp2 = gpu_contiguous(as_cuda_ndarray_variable(inp2))
+
+        assert inp1.dtype == "float32"
+        assert inp2.dtype == "float32"
+        assert inp1.ndim == 3 # (batch, a, b)
+        assert inp2.ndim == 3
+
+        return theano.Apply(self, [inp1, inp2],
+                           [self.output_type(inp1, inp2)()])
+
+    def output_type(self, inp1, inp2):
+        return CudaNdarrayType(
+            (inp1.type.broadcastable[0] or inp2.type.broadcastable[0],
+             inp1.type.broadcastable[1], inp2.type.broadcastable[2]))
+
+    def c_code(self, node, name, input_names, output_names, sub):
+        bx, by = input_names
+        bz, = output_names
+        fail = sub['fail']
+        return """
+        float alpha = 1.0;
+        float beta = 0.0;
+
+        int i, x_dim0, x_dim1, x_dim2, y_dim0, y_dim1, y_dim2;
+        int x_stride, y_stride, z_stride, total_size;
+        int ptr_array_size = 3 * CudaNdarray_HOST_DIMS(%(bx)s)[0] * sizeof(float *);
+        int out_dim[3];
+
+        cublasStatus_t err;
+        cudaError_t err1;
+
+        float **host_x = NULL;
+        float **host_z = NULL;
+        float **host_y = NULL;
+
+        float **gpu_x = NULL;
+        float **gpu_y = NULL;
+        float **gpu_z = NULL;
+
+        x_dim0 = CudaNdarray_HOST_DIMS(%(bx)s)[0];
+        x_dim1 = CudaNdarray_HOST_DIMS(%(bx)s)[1];
+        x_dim2 = CudaNdarray_HOST_DIMS(%(bx)s)[2];
+
+        y_dim0 = CudaNdarray_HOST_DIMS(%(by)s)[0];
+        y_dim1 = CudaNdarray_HOST_DIMS(%(by)s)[1];
+        y_dim2 = CudaNdarray_HOST_DIMS(%(by)s)[2];
+
+        if (x_dim0 != y_dim0)
+        {
+            PyErr_Format(PyExc_RuntimeError,
+                    "The batchsizes (%%d, %%d) don't match.\\n",
+                    x_dim0, x_dim1);
+            %(fail)s;
+        }
+
+        if (x_dim2 != y_dim1)
+        {
+            PyErr_Format(PyExc_RuntimeError,
+                    "Shape mismatch. (%%d, %%d, %%d) (%%d, %%d, %%d)\\n",
+                    x_dim0, x_dim1, x_dim2, y_dim0, y_dim1, y_dim2);
+            %(fail)s;
+        }
+
+        out_dim[0] = x_dim0;
+        out_dim[1] = x_dim1;
+        out_dim[2] = y_dim2;
+
+        if ( !(%(bz)s
+               && %(bz)s->nd==3
+               && CudaNdarray_is_c_contiguous(%(bz)s)
+               && CudaNdarray_HOST_DIMS(%(bz)s)[0]==out_dim[0]
+               && CudaNdarray_HOST_DIMS(%(bz)s)[1]==out_dim[1]
+               && CudaNdarray_HOST_DIMS(%(bz)s)[2]==out_dim[2]))
+        {
+            Py_XDECREF(%(bz)s);
+            %(bz)s = (CudaNdarray*)CudaNdarray_NewDims(3,out_dim);
+            if (NULL == %(bz)s)
+            {
+                PyErr_Format(PyExc_RuntimeError,
+                        "Failed to allocate output of %%d x %%d x %%d",
+                        out_dim[0], out_dim[1], out_dim[2]);
+                %(fail)s;
+            }
+        }
+
+        if (x_dim0 != 0 && y_dim0 != 0 &&
+            x_dim1 != 0 && y_dim1 != 0 &&
+            x_dim2 != 0 && y_dim2 != 0)
+        {
+            x_stride = CudaNdarray_HOST_STRIDES(%(bx)s)[0];
+            y_stride = CudaNdarray_HOST_STRIDES(%(by)s)[0];
+            z_stride = CudaNdarray_HOST_STRIDES(%(bz)s)[0];
+
+            host_x = (float **) malloc (ptr_array_size);
+
+            if (host_x == NULL)
+            {
+                CLEANUP();
+                PyErr_Format(PyExc_RuntimeError,
+                             "%%s", "malloc failure");
+                %(fail)s;
+            }
+
+            host_y = &host_x[x_dim0];
+            host_z = &host_y[x_dim0];
+
+            host_x[0] = CudaNdarray_DEV_DATA(%(bx)s);
+            host_y[0] = CudaNdarray_DEV_DATA(%(by)s);
+            host_z[0] = CudaNdarray_DEV_DATA(%(bz)s);
+
+            for (i = 1; i < out_dim[0]; i++)
+            {
+                host_x[i] = host_x[i - 1] + x_stride;
+                host_y[i] = host_y[i - 1] + y_stride;
+                host_z[i] = host_z[i - 1] + z_stride;
+            }
+
+            gpu_x = (float **) device_malloc(ptr_array_size);
+
+            if (gpu_x == NULL){
+                %(fail)s;
+            }
+
+            gpu_y = &gpu_x[x_dim0];
+            gpu_z = &gpu_y[x_dim0];
+
+            err1 = cudaMemcpy(gpu_x, host_x, ptr_array_size, cudaMemcpyHostToDevice);
+
+            if (err1 != cudaSuccess)
+            {
+                CLEANUP();
+                PyErr_Format(PyExc_RuntimeError,
+                             "%%s", "cudaMemcpy failure");
+                %(fail)s;
+            }
+
+            err = cublasSgemmBatched(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                               y_dim2, x_dim1, x_dim2, &alpha,
+                               (const float **) gpu_y, y_dim2,
+                               (const float **) gpu_x, x_dim2, &beta,
+                               gpu_z, y_dim2, x_dim0);
+
+            CLEANUP();
+
+            if (CUBLAS_STATUS_SUCCESS != err)
+            {
+                PyErr_Format(PyExc_RuntimeError,
+                             "cublasSgemmBatched failed (%%i) %%s",
+                             err,  cublasGetErrorString(err));
+                %(fail)s;
+            }
+        }
+        else
+        {
+            total_size = x_dim0 * x_dim1 * y_dim2 * sizeof(float);
+            if (cudaSuccess != cudaMemset(CudaNdarray_DEV_DATA(%(bz)s), 0, total_size))
+            {
+                PyErr_Format(PyExc_RuntimeError,
+                        "Failed to fill output with zeros");
+                %(fail)s;
+            }
+        }
+
+        """ % locals()
+
+    def c_support_code(self):
+        return """
+        #define CLEANUP()                               \
+            do                                          \
+            {                                           \
+                if (host_x) free (host_x);              \
+                if (gpu_x) device_free(gpu_x);          \
+            } while (0)
+        """
+
+    def grad(self, inp, grads):
+        x, y = inp
+        gz, = grads
+
+        xgrad = batched_dot(gz, y.dimshuffle(0, 2, 1))
+        ygrad = batched_dot(x.dimshuffle(0, 2, 1), gz)
+
+        rval = xgrad, ygrad
+
+        for elem in rval:
+            assert elem.dtype.find('float') != -1
+
+        return rval
+
+    def c_code_cache_version(self):
+        return (1,)
+
+batched_dot = BatchedDotOp()
 
 class GpuDot22(GpuOp):
     """
@@ -98,6 +298,8 @@ gpu_dot22 = GpuDot22()
 class GpuDot22Scalar(GpuOp):
     """
     Implement dot(2d, 2d) * scalar on the gpu.
+
+    :note: Not used anymore. Keep to allow unpickle of old graph.
     """
     def __str__(self):
         return 'GpuDot22Scalar'
@@ -233,7 +435,7 @@ class GpuGemm(GpuOp):
         fail = sub['fail']
         sio = StringIO()
 
-        print >> sio, """
+        print("""
 
         #define REAL float
         float %(name)s_a = (PyArray_TYPE(%(a)s) == NPY_FLOAT)
@@ -295,7 +497,7 @@ class GpuGemm(GpuOp):
         {
             %(fail)s;
         }
-        """
+        """, file=sio)
 
         return sio.getvalue() % locals()
 gpu_gemm_no_inplace = GpuGemm(inplace=False)
@@ -350,7 +552,7 @@ class GpuGemv(GpuOp):
         fail = sub['fail']
         sio = StringIO()
 
-        print >> sio, """
+        print("""
         float %(name)s_alpha = ((dtype_%(a)s*)(PyArray_DATA(%(a)s)))[0];
         float %(name)s_beta = ((dtype_%(b)s*)(PyArray_DATA(%(b)s)))[0];
 
@@ -393,7 +595,7 @@ class GpuGemv(GpuOp):
         {
             %(fail)s;
         }
-        """
+        """, file=sio)
         return sio.getvalue() % locals()
 gpu_gemv_no_inplace = GpuGemv(inplace=False)
 gpu_gemv_inplace = GpuGemv(inplace=True)
@@ -447,7 +649,7 @@ class GpuGer(GpuOp):
         fail = sub['fail']
         sio = StringIO()
 
-        print >> sio, """
+        print("""
         float %(name)s_alpha = ((dtype_%(a)s*)(PyArray_DATA(%(a)s)))[0];
 
         if (%(inplace)s
@@ -498,7 +700,7 @@ class GpuGer(GpuOp):
         {
             %(fail)s;
         }
-        """
+        """, file=sio)
         return sio.getvalue() % locals()
 gpu_ger_no_inplace = GpuGer(inplace=False)
 gpu_ger_inplace = GpuGer(inplace=True)
@@ -524,7 +726,7 @@ class BaseGpuCorrMM(GpuOp):
                 'do not use pad for BaseGpuCorrMM; please set padding in '
                 'border_mode parameter, see the docstring for more details')
             if border_mode != "valid":
-                raise ValueError("border_mode must be 'valid'")
+                raise ValueError("border_mode must be 'valid' if pad is given")
             border_mode = pad
         if isinstance(border_mode, int):
             border_mode = (border_mode, border_mode)
@@ -668,7 +870,7 @@ class BaseGpuCorrMM(GpuOp):
     int dW = %(dW)s;
     int padH = %(padH)s;
     int padW = %(padW)s;
-    
+
     CudaNdarray * bottom = %(bottom)s;
     CudaNdarray * weights = %(weights)s;
     CudaNdarray * top = %(top)s;
@@ -793,20 +995,21 @@ class BaseGpuCorrMM(GpuOp):
 class GpuCorrMM(BaseGpuCorrMM):
     """GPU correlation implementation using Matrix Multiplication.
 
-    :param border_mode: currently supports "valid" only; "full" can be
-        simulated by setting `pad="full"` (at the cost of performance), or
-        by using `GpuCorrMM_gradInputs`
+    :param border_mode: the width of a border of implicit zeros to pad the
+        input with. Must be a tuple with 2 elements giving the numbers of rows
+        and columns to pad on each side, or a single integer to pad the same
+        on all sides, or a string shortcut setting the padding at runtime:
+        ``'valid'`` for ``(0, 0)`` (valid convolution, no padding), ``'full'``
+        for ``(kernel_rows - 1, kernel_columns - 1)`` (full convolution),
+        ``'half'`` for ``(kernel_rows // 2, kernel_columns // 2)`` (same
+        convolution for odd-sized kernels). Note that the two widths are each
+        applied twice, once per side (left and right, top and bottom).
     :param subsample: the subsample operation applied to each output image.
         Should be a tuple with 2 elements.
         `(sv, sh)` is equivalent to `GpuCorrMM(...)(...)[:,:,::sv, ::sh]`,
         but faster.
         Set to `(1, 1)` to disable subsampling.
-    :param pad: the width of a border of implicit zeros to pad the input
-        image with. Should be a tuple with 2 elements giving the numbers of
-        rows and columns to pad on each side, or "half" to set the padding
-        to `(kernel_rows // 2, kernel_columns // 2)`, or "full" to set the
-        padding to `(kernel_rows - 1, kernel_columns - 1)` at runtime.
-        Set to `(0, 0)` to disable padding.
+    :param pad: deprecated alias for `border_mode`.
 
     :note: Currently, the Op requires the inputs, filters and outputs to be
         C-contiguous. Use :func:`gpu_contiguous
@@ -1601,6 +1804,12 @@ class GpuConv(GpuOp):
             self.max_threads_dim0 = None
         if not hasattr(self, "direction_hint"):
             self.direction_hint = None
+        if not hasattr(self, "nkern"):
+            self.nkern = None
+        if not hasattr(self, "bsize"):
+            self.bsize = None
+        if not hasattr(self, "fft_opt"):
+            self.fft_opt = True
 
     def __hash__(self):
         # don't use hash(self.version) as hash(-1)==-2 and
@@ -1688,7 +1897,7 @@ class GpuConv(GpuOp):
 
     def c_code_cache_version(self):
         # raise this whenever modifying any of the support_code_files
-        return (0, 22)
+        return (0, 23)
 
     def c_support_code_apply(self, node, nodename):
         # REMEMBER TO RAISE c_code_cache_version when changing any of
@@ -2164,7 +2373,7 @@ class GpuDownsampleFactorMaxGradGrad(GpuOp):
     Implement the grad of downsample with max on the gpu.
     """
     __props__ = ('ds', 'ignore_border')
-    
+
     def __init__(self, ds, ignore_border):
         self.ds = tuple(ds)
         self.ignore_border = ignore_border
@@ -2173,14 +2382,14 @@ class GpuDownsampleFactorMaxGradGrad(GpuOp):
         x = as_cuda_ndarray_variable(x)
         z = as_cuda_ndarray_variable(z)
         gx = as_cuda_ndarray_variable(gx)
-        
+
         if x.type.ndim != 4:
             raise TypeError('x must be 4D tensor')
         if z.type.ndim != 4:
             raise TypeError('z must be 4D tensor')
         if gx.type.ndim != 4:
             raise TypeError('gx must be 4D tensor')
-        
+
         return Apply(self, [x, z, gx], [x.type()])
 
     def c_code_cache_version(self):
@@ -2222,7 +2431,7 @@ class GpuDownsampleFactorMaxGradGrad(GpuOp):
             }
         }
         {
-            
+
             int needs_extra_z_col = %(ignore_border)s && (CudaNdarray_HOST_DIMS(%(x)s)[2] %% %(ds0)s);
             dim3 grid(std::min(CudaNdarray_HOST_DIMS(%(z)s)[0], 65535),
                       CudaNdarray_HOST_DIMS(%(z)s)[2] + (needs_extra_z_col ? 1 : 0));
@@ -2334,12 +2543,12 @@ class GpuDownsampleFactorMaxGradGrad(GpuOp):
                         {
                             // my_gx = gx[image_row][image_col][x_row][x_col]
                             my_gx = gx[i0*gxS0 + i1*gxS1 + x_row*gxS2 + x_col*gxS3];
-                            
+
                             if (my_z == x[i0*xS0 + i1*xS1 + x_row*xS2 + x_col*xS3]) {
                                 gz[i0 *  gzS0 + i1 *  gzS1 + i2 *  gzS2 + z_col* gzS3] = my_gx;
                             }
                         }
-                        
+
 
                     }
                 }
