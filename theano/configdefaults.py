@@ -4,7 +4,8 @@ import logging
 
 import theano
 from theano.configparser import (AddConfigVar, BoolParam, ConfigParam, EnumStr,
-                                 IntParam, StrParam, TheanoConfigParser)
+                                 FloatParam, IntParam, StrParam,
+                                 TheanoConfigParser)
 from theano.misc.cpucount import cpuCount
 from theano.misc.windows import call_subprocess_Popen
 
@@ -73,19 +74,19 @@ class DeviceParam(ConfigParam):
         self.default = default
 
         def filter(val):
-            if val.startswith('cpu') or val.startswith('gpu') \
+            if val == self.default or val.startswith('gpu') \
                     or val.startswith('opencl') or val.startswith('cuda'):
                 return val
             else:
                 raise ValueError(('Invalid value ("%s") for configuration '
                                   'variable "%s". Valid options start with '
-                                  'one of "cpu", "gpu", "opencl", "cuda"'
-                                  % (val, self.fullname)))
+                                  'one of "%s", "gpu", "opencl", "cuda"'
+                                  % (self.default, val, self.fullname)))
         over = kwargs.get("allow_override", True)
         super(DeviceParam, self).__init__(default, filter, over)
 
     def __str__(self):
-        return '%s (cpu, gpu*, opencl*, cuda*) ' % (self.fullname,)
+        return '%s (%s, gpu*, opencl*, cuda*) ' % (self.fullname, self.default)
 
 AddConfigVar(
     'device',
@@ -94,15 +95,7 @@ AddConfigVar(
      "on it. Do not use upper case letters, only lower case even if "
      "NVIDIA use capital letters."),
     DeviceParam('cpu', allow_override=False),
-    in_c_key=False,)
-
-AddConfigVar('gpuarray.init_device',
-             """
-             Device to initialize for gpuarray use without moving
-             computations automatically.
-             """,
-             StrParam(''),
-             in_c_key=False)
+    in_c_key=False)
 
 AddConfigVar(
     'init_gpu_device',
@@ -110,12 +103,7 @@ AddConfigVar(
      "Unlike 'device', setting this option will NOT move computations, "
      "nor shared variables, to the specified GPU. "
      "It can be used to run GPU-specific tests on a particular GPU."),
-    EnumStr('', 'gpu',
-            'gpu0', 'gpu1', 'gpu2', 'gpu3',
-            'gpu4', 'gpu5', 'gpu6', 'gpu7',
-            'gpu8', 'gpu9', 'gpu10', 'gpu11',
-            'gpu12', 'gpu13', 'gpu14', 'gpu15',
-            allow_override=False),
+    DeviceParam('', allow_override=False),
     in_c_key=False)
 
 AddConfigVar(
@@ -124,12 +112,230 @@ AddConfigVar(
     BoolParam(False, allow_override=False),
     in_c_key=False)
 
+
+class ContextsParam(ConfigParam):
+    def __init__(self):
+        def filter(val):
+            if val == '':
+                return val
+            for v in val.split(';'):
+                s = v.split('->')
+                if len(s) != 2:
+                    raise ValueError("Malformed context map: %s" % (v,))
+                if (s[0] == 'cpu' or s[0].startswith('cuda') or
+                        s[0].startswith('opencl')):
+                    raise ValueError("Cannot use %s as context name" % (s[0],))
+            return val
+        ConfigParam.__init__(self, '', filter, False)
+
+AddConfigVar(
+    'contexts',
+    """
+    Context map for multi-gpu operation. Format is a
+    semicolon-separated list of names and device names in the
+    'name->dev_name' format. An example that would map name 'test' to
+    device 'cuda0' and name 'test2' to device 'opencl0:0' follows:
+    "test->cuda0;test2->opencl0:0".
+
+    Invalid context names are 'cpu', 'cuda*' and 'opencl*'
+    """, ContextsParam(), in_c_key=False)
+
 AddConfigVar(
     'print_active_device',
     "Print active device at when the GPU device is initialized.",
     BoolParam(True, allow_override=False),
     in_c_key=False)
 
+
+AddConfigVar(
+    'enable_initial_driver_test',
+    "Tests the nvidia driver when a GPU device is initialized.",
+    BoolParam(True, allow_override=False),
+    in_c_key=False)
+
+
+def default_cuda_root():
+    v = os.getenv('CUDA_ROOT', "")
+    if v:
+        return v
+    s = os.getenv("PATH")
+    if not s:
+        return ''
+    for dir in s.split(os.path.pathsep):
+        if os.path.exists(os.path.join(dir, "nvcc")):
+            return os.path.dirname(os.path.abspath(dir))
+    return ''
+
+AddConfigVar(
+    'cuda.root',
+    """directory with bin/, lib/, include/ for cuda utilities.
+       This directory is included via -L and -rpath when linking
+       dynamically compiled modules.  If AUTO and nvcc is in the
+       path, it will use one of nvcc parent directory.  Otherwise
+       /usr/local/cuda will be used.  Leave empty to prevent extra
+       linker directives.  Default: environment variable "CUDA_ROOT"
+       or else "AUTO".
+       """,
+    StrParam(default_cuda_root),
+    in_c_key=False)
+
+
+def filter_nvcc_flags(s):
+    assert isinstance(s, str)
+    flags = [flag for flag in s.split(' ') if flag]
+    if any([f for f in flags if not f.startswith("-")]):
+        raise ValueError(
+            "Theano nvcc.flags support only parameter/value pairs without"
+            " space between them. e.g.: '--machine 64' is not supported,"
+            " but '--machine=64' is supported. Please add the '=' symbol."
+            " nvcc.flags value is '%s'" % s)
+    return ' '.join(flags)
+
+AddConfigVar('nvcc.flags',
+             "Extra compiler flags for nvcc",
+             ConfigParam("", filter_nvcc_flags),
+             # Not needed in c key as it is already added.
+             # We remove it as we don't make the md5 of config to change
+             # if theano.sandbox.cuda is loaded or not.
+             in_c_key=False)
+
+AddConfigVar('nvcc.compiler_bindir',
+             "If defined, nvcc compiler driver will seek g++ and gcc"
+             " in this directory",
+             StrParam(""),
+             in_c_key=False)
+
+AddConfigVar('nvcc.fastmath',
+             "",
+             BoolParam(False),
+             # Not needed in c key as it is already added.
+             # We remove it as we don't make the md5 of config to change
+             # if theano.sandbox.cuda is loaded or not.
+             in_c_key=False)
+
+AddConfigVar('gpuarray.sync',
+             """If True, every op will make sure its work is done before
+                returning.  Setting this to True will slow down execution,
+                but give much more accurate results in profiling.""",
+             BoolParam(False),
+             in_c_key=True)
+
+AddConfigVar('gpuarray.preallocate',
+             """If 0 it doesn't do anything.  If between 0 and 1 it
+             will preallocate that fraction of the total GPU memory.
+             If 1 or greater it will preallocate that amount of memory
+             (in megabytes).""",
+             FloatParam(0, lambda i: i >= 0),
+             in_c_key=False)
+
+
+def safe_no_dnn_workmem(workmem):
+    """
+    Make sure the user is not attempting to use dnn.conv.workmem`.
+    """
+    if workmem:
+        raise RuntimeError(
+            'The option `dnn.conv.workmem` has been removed and should '
+            'not be used anymore. Please use the option '
+            '`dnn.conv.algo_fwd` instead.')
+    return True
+
+AddConfigVar('dnn.conv.workmem',
+             "This flag is deprecated; use dnn.conv.algo_fwd.",
+             ConfigParam('', allow_override=False, filter=safe_no_dnn_workmem),
+             in_c_key=False)
+
+
+def safe_no_dnn_workmem_bwd(workmem):
+    """
+    Make sure the user is not attempting to use dnn.conv.workmem_bwd`.
+    """
+    if workmem:
+        raise RuntimeError(
+            'The option `dnn.conv.workmem_bwd` has been removed and '
+            'should not be used anymore. Please use the options '
+            '`dnn.conv.algo_bwd_filter` and `dnn.conv.algo_bwd_data` instead.')
+    return True
+
+AddConfigVar('dnn.conv.workmem_bwd',
+             "This flag is deprecated; use dnn.conv.algo_bwd.",
+             ConfigParam('', allow_override=False,
+                         filter=safe_no_dnn_workmem_bwd),
+             in_c_key=False)
+
+
+def safe_no_dnn_algo_bwd(algo):
+    """
+    Make sure the user is not attempting to use dnn.conv.algo_bwd`.
+    """
+    if algo:
+        raise RuntimeError(
+            'The option `dnn.conv.algo_bwd` has been removed and '
+            'should not be used anymore. Please use the options '
+            '`dnn.conv.algo_bwd_filter` and `dnn.conv.algo_bwd_data` instead.')
+    return True
+
+AddConfigVar('dnn.conv.algo_bwd',
+             "This flag is deprecated; use dnn.conv.algo_bwd_data and "
+             "dnn.conv.algo_bwd_filter.",
+             ConfigParam('', allow_override=False,
+                         filter=safe_no_dnn_algo_bwd),
+             in_c_key=False)
+
+AddConfigVar('dnn.conv.algo_fwd',
+             "Default implementation to use for CuDNN forward convolution.",
+             EnumStr('small', 'none', 'large', 'fft', 'fft_tiling',
+                     'guess_once', 'guess_on_shape_change',
+                     'time_once', 'time_on_shape_change'),
+             in_c_key=False)
+
+AddConfigVar('dnn.conv.algo_bwd_data',
+             "Default implementation to use for CuDNN backward convolution to "
+             "get the gradients of the convolution with regard to the inputs.",
+             EnumStr('none', 'deterministic', 'fft', 'fft_tiling',
+                     'guess_once', 'guess_on_shape_change', 'time_once',
+                     'time_on_shape_change'),
+             in_c_key=False)
+
+AddConfigVar('dnn.conv.algo_bwd_filter',
+             "Default implementation to use for CuDNN backward convolution to "
+             "get the gradients of the convolution with regard to the "
+             "filters.",
+             EnumStr('none', 'deterministic', 'fft', 'small', 'guess_once',
+                     'guess_on_shape_change', 'time_once',
+                     'time_on_shape_change'),
+             in_c_key=False)
+
+AddConfigVar('dnn.conv.precision',
+             "Default data precision to use for the computation in CuDNN "
+             "convolutions (defaults to the same dtype as the inputs of the "
+             "convolutions).",
+             EnumStr('as_input', 'float16', 'float32', 'float64'),
+             in_c_key=False)
+
+
+def default_dnn_path(suffix):
+    def f(suffix=suffix):
+        if config.cuda.root == '':
+            return ''
+        return os.path.join(config.cuda.root, suffix)
+    return f
+
+AddConfigVar('dnn.include_path',
+             "Location of the cudnn header (defaults to the cuda root)",
+             StrParam(default_dnn_path('include')))
+
+AddConfigVar('dnn.library_path',
+             "Location of the cudnn header (defaults to the cuda root)",
+             StrParam(default_dnn_path('lib64')))
+
+AddConfigVar('dnn.enabled',
+             "'auto', use CuDNN if available, but silently fall back"
+             " to not using it if not present."
+             " If True and CuDNN can not be used, raise an error."
+             " If False, disable cudnn",
+             StrParam("auto", "True", "False"),
+             in_c_key=False)
 
 # This flag determines whether or not to raise error/warning message if
 # there is a CPU Op in the computational graph.
@@ -328,10 +534,14 @@ AddConfigVar(
 AddConfigVar(
     'traceback.limit',
     "The number of stack to trace. -1 mean all.",
-    # We default to 6 to be able to know where v1 + v2 is created in the
+    # We default to a number to be able to know where v1 + v2 is created in the
     # user script. The bigger this number is, the more run time it takes.
-    # We need to default to 7 to support theano.tensor.tensor(...).
-    IntParam(7),
+    # We need to default to 8 to support theano.tensor.tensor(...).
+    # import theano, numpy
+    # X = theano.tensor.matrix()
+    # y = X.reshape((5,3,1))
+    # assert y.tag.trace
+    IntParam(8),
     in_c_key=False)
 
 AddConfigVar('experimental.mrg',
@@ -519,6 +729,16 @@ AddConfigVar(
     in_c_key=False)
 
 
+AddConfigVar(
+    'print_test_value',
+    ("If 'True', the __eval__ of a Theano variable will return its test_value "
+     "when this is available. This has the practical conseguence that, e.g., "
+     "in debugging `my_var` will print the same as `my_var.tag.test_value` "
+     "when a test value is defined."),
+    BoolParam(False),
+    in_c_key=False)
+
+
 AddConfigVar('compute_test_value_opt',
              ("For debugging Theano optimization only."
               " Same as compute_test_value, but is used"
@@ -623,3 +843,20 @@ AddConfigVar(
     "the first optimization, and could possibly still contains some bugs. "
     "Use at your own risks.",
     BoolParam(False))
+
+
+def good_seed_param(seed):
+    if seed == "random":
+        return True
+    try:
+        int(seed)
+    except Exception:
+        return False
+    return True
+
+
+AddConfigVar('unittests.rseed',
+             "Seed to use for randomized unit tests. "
+             "Special value 'random' means using a seed of None.",
+             StrParam(666, is_valid=good_seed_param),
+             in_c_key=False)

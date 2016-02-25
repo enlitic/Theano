@@ -2,7 +2,6 @@ from itertools import product
 import time
 import unittest
 
-from nose.plugins.attrib import attr
 from nose.plugins.skip import SkipTest
 import numpy
 from six.moves import xrange
@@ -19,6 +18,7 @@ from theano import sparse
 from theano import compile, config, gof
 from theano.sparse import enable_sparse
 from theano.tensor.basic import _allclose
+from theano.tests.unittest_tools import attr
 
 if not enable_sparse:
     raise SkipTest('Optional package SciPy not installed')
@@ -117,7 +117,7 @@ def sparse_random_inputs(format, shape, n=1, out_dtype=None, p=0.5, gap=None,
     if out_dtype is None:
         out_dtype = theano.config.floatX
 
-    assert 0 <= p and p <= 1
+    assert 0 <= p <= 1
     assert len(shape) == 2
     assert out_dtype in sparse.all_dtypes
     assert gap is None or isinstance(gap, (tuple, list))

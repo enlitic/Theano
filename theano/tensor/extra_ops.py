@@ -504,18 +504,6 @@ def bincount(x, weights=None, minlength=None, assert_nonneg=False):
     .. versionadded:: 0.6
 
     """
-    compatible_type = ('int8', 'int16', 'int32', 'int64',
-                       'uint8', 'uint16', 'uint32')
-    unsupported_dtypes = ('uint64',)
-
-    if x.dtype in unsupported_dtypes:
-            raise TypeError(
-                ("Input dtype %s is not supported, "
-                 % unsupported_dtypes), x.dtype)
-
-    if x.dtype not in compatible_type:
-        raise TypeError("Inputs dtype must be an integer.")
-
     if x.ndim != 1:
         raise TypeError("Inputs must be of dimension 1.")
 
@@ -732,9 +720,15 @@ def repeat(x, repeats, axis=None):
     if repeats.ndim > 1:
         raise ValueError('The dimension of repeats should not exceed 1.')
 
-    if repeats.ndim == 1:
-        return RepeatOp(axis=axis)(x, repeats)
+    if repeats.ndim == 1 and not repeats.broadcastable[0]:
+            return RepeatOp(axis=axis)(x, repeats)
     else:
+        if repeats.ndim == 1:
+            repeats = repeats[0]
+
+        if x.dtype == 'uint64':
+            raise TypeError("theano.tensor.repeat don't support dtype uint64")
+
         if axis is None:
             axis = 0
             x = x.flatten()

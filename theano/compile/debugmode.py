@@ -580,7 +580,7 @@ def debugprint(r, prefix='', depth=-1, done=None, print_type=False,
                print_view_map=False, order=None, ids='CHAR',
                stop_on_name=False, prefix_child=None,
                scan_ops=None, profile=None,
-               scan_inner_to_outer_inputs=None):
+               scan_inner_to_outer_inputs=None, smap=None):
     """
     Print the graph leading to `r` to given depth.
 
@@ -620,7 +620,8 @@ def debugprint(r, prefix='', depth=-1, done=None, print_type=False,
     scan_inner_to_outer_inputs
         A dictionary mapping a scan ops inner function inputs to the scan op
         inputs (outer inputs) for printing purposes.
-
+    smap
+        None or the storage_map when printing an Theano function.
     """
     if depth == 0:
         return
@@ -646,11 +647,11 @@ def debugprint(r, prefix='', depth=-1, done=None, print_type=False,
         if obj in done:
             id_str = done[obj]
         elif ids == "id":
-            id_str = "[@%s]" % str(id(r))
+            id_str = "[id %s]" % str(id(r))
         elif ids == "int":
-            id_str = "[@%s]" % str(len(done))
+            id_str = "[id %s]" % str(len(done))
         elif ids == "CHAR":
-            id_str = "[@%s]" % char_from_number(len(done))
+            id_str = "[id %s]" % char_from_number(len(done))
         elif ids == "":
             id_str = ""
         done[obj] = id_str
@@ -689,23 +690,21 @@ def debugprint(r, prefix='', depth=-1, done=None, print_type=False,
         already_printed = a in done  # get_id_str put it in the dict
         id_str = get_id_str(a)
 
+        if len(a.outputs) == 1:
+            idx = ""
+        else:
+            idx = ".%i" % a.outputs.index(r)
+        data = ""
+        if smap:
+            data = " " + str(smap.get(a.outputs[0], ''))
         if profile is None or a not in profile.apply_time:
-            if len(a.outputs) == 1:
-                print('%s%s %s%s \'%s\' %s %s %s' % (prefix, a.op,
-                                                     id_str,
-                                                     type_str,
+            print('%s%s%s %s%s \'%s\' %s %s %s%s' % (prefix, a.op,
+                                                     idx,
+                                                     id_str, type_str,
                                                      r_name,
                                                      destroy_map_str,
                                                      view_map_str,
-                                                     o), file=file)
-            else:
-                print('%s%s.%i %s%s \'%s\' %s %s %s' % (prefix, a.op,
-                                                        a.outputs.index(r),
-                                                        id_str, type_str,
-                                                        r_name,
-                                                        destroy_map_str,
-                                                        view_map_str,
-                                                        o), file=file)
+                                                     o, data), file=file)
         else:
             op_time = profile.apply_time[a]
             op_time_percent = (op_time / profile.fct_call_time) * 100
@@ -714,31 +713,22 @@ def debugprint(r, prefix='', depth=-1, done=None, print_type=False,
             tot_time_percent = (tot_time_dict[a] / profile.fct_call_time) * 100
 
             if len(a.outputs) == 1:
-                print("%s%s %s%s '%s' %s %s %s --> "
-                      "%8.2es %4.1f%% %8.2es %4.1f%%"
-                      % (prefix, a.op,
-                         id_str,
-                         type_str,
-                         r_name,
-                         destroy_map_str,
-                         view_map_str,
-                         o, op_time,
-                         op_time_percent,
-                         tot_time,
-                         tot_time_percent), file=file)
+                idx = ""
             else:
-                print("%s%s.%i %s%s '%s' %s %s %s --> "
-                      "%8.2es %4.1f%% %8.2es %4.1f%%"
-                      % (prefix, a.op,
-                         a.outputs.index(r),
-                         id_str, type_str,
-                         r_name,
-                         destroy_map_str,
-                         view_map_str,
-                         o, op_time,
-                         op_time_percent,
-                         tot_time,
-                         tot_time_percent), file=file)
+                idx = ".%i" % a.outputs.index(r)
+            print("%s%s%s %s%s '%s' %s %s %s%s --> "
+                  "%8.2es %4.1f%% %8.2es %4.1f%%"
+                  % (prefix, a.op,
+                     idx,
+                     id_str, type_str,
+                     r_name,
+                     destroy_map_str,
+                     view_map_str,
+                     o, data,
+                     op_time,
+                     op_time_percent,
+                     tot_time,
+                     tot_time_percent), file=file)
 
         if not already_printed:
             if (not stop_on_name or
@@ -761,7 +751,8 @@ def debugprint(r, prefix='', depth=-1, done=None, print_type=False,
                         ids=ids, stop_on_name=stop_on_name,
                         prefix_child=new_prefix_child, scan_ops=scan_ops,
                         profile=profile,
-                        scan_inner_to_outer_inputs=scan_inner_to_outer_inputs)
+                        scan_inner_to_outer_inputs=scan_inner_to_outer_inputs,
+                        smap=smap)
     else:
         if scan_inner_to_outer_inputs is not None and\
            r in scan_inner_to_outer_inputs:
@@ -777,8 +768,13 @@ def debugprint(r, prefix='', depth=-1, done=None, print_type=False,
                                        outer_id_str), file=file)
         else:
             # this is an input variable
+            data = ""
+            if smap:
+                data = " " + str(smap.get(r, ''))
             id_str = get_id_str(r)
-            print('%s%s %s%s' % (prefix, r, id_str, type_str), file=file)
+            print('%s%s %s%s%s' % (prefix, r, id_str,
+                                   type_str, data),
+                  file=file)
 
     return file
 
@@ -1788,8 +1784,7 @@ class _VariableEquivalenceTracker(object):
 # List of default version of make thunk.
 # This is needed to know if the user overrided it.
 # The GpuOp will be added here when theano.sandbox.cuda is imported.
-default_make_thunk = [get_unbound_function(theano.gof.Op.make_thunk),
-                      get_unbound_function(theano.gof.OpenMPOp.make_thunk)]
+default_make_thunk = [get_unbound_function(theano.gof.Op.make_thunk)]
 
 
 # Debug mode cheats and initializes the linker in a different way in
@@ -1883,6 +1878,10 @@ class _Linker(gof.link.LocalLinker):
                 thunk.inputs = [storage_map[v] for v in node.inputs]
                 thunk.outputs = [storage_map[v] for v in node.outputs]
                 thunk_other = thunk
+            else:
+                new_node = node.op.prepare_node(node)
+                if new_node is not None:
+                    node = new_node
 
             try:
                 if not self.maker.mode.check_c_code:
@@ -1943,10 +1942,7 @@ class _Linker(gof.link.LocalLinker):
                                 if r not in fgraph.inputs]
 
         # Precompute some things for storage pre-allocation
-        try:
-            def_val = int(config.unittests.rseed)
-        except ValueError:
-            def_val = 666
+        def_val = int(config.unittests.rseed)
 
         #####
         # This is the function that runs when you evaluate the graph
@@ -2050,7 +2046,7 @@ class _Linker(gof.link.LocalLinker):
                                       "output storage", i)
                         try:
                             thunk_py()
-                        except utils.MethodNotDefined:
+                        except (utils.MethodNotDefined, NotImplementedError):
                             # shouldn't have put it into the list in
                             # the first place
                             thunk_py = None
@@ -2259,8 +2255,8 @@ class _Linker(gof.link.LocalLinker):
                     for r in node.outputs:
                         if r not in r_vals:
                             idx = order.index(node)
-                            assert thunks_py[idx] is None
-                            assert thunks_c[idx] is None
+                            assert thunks_py[idx] is None, node
+                            assert thunks_c[idx] is None, node
                             raise Exception("No code run for %s" % node)
 
                 if False:
@@ -2403,13 +2399,15 @@ class _Maker(FunctionMaker):  # inheritance buys a few helper functions
 
     """
 
-    def __init__(self, inputs, outputs, optimizer, mode,
+    def __init__(self, inputs, outputs, mode,
                  accept_inplace=False,
                  function_builder=Function,
                  profile=None,
                  on_unused_input=None,
+                 fgraph=None,  # If present the optimized graph. we ignore it.
                  output_keys=None):
         self.profile = profile
+        optimizer = mode.optimizer
         # Handle the case where inputs and/or outputs is a single
         # Variable (not in a list)
         unpack_single = False
@@ -2523,6 +2521,7 @@ class _Maker(FunctionMaker):  # inheritance buys a few helper functions
         self.accept_inplace = accept_inplace
         self.function_builder = function_builder
         self.mode = mode
+        self.on_unused_input = on_unused_input  # Used for the pickling/copy
         self.output_keys = output_keys
 
     def create(self, defaults=None, trustme=False, storage_map=None):
@@ -2744,7 +2743,7 @@ class DebugMode(Mode):
 
         """
         assert m is self
-        return _Maker(i, o, self.optimizer, self, *args, **kwargs)
+        return _Maker(i, o, self, *args, **kwargs)
 
     def __init__(self,
                  optimizer='fast_run',

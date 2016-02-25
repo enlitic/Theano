@@ -8,12 +8,11 @@ from numpy import (arange, array, common_type, complex64, complex128, float32,
                   float64, newaxis, shape, transpose, zeros)
 from numpy.testing import assert_array_almost_equal
 
-from nose.plugins.attrib import attr
 from six.moves import xrange
 
 import theano
 import theano.tensor as T
-from theano import tensor, Param, shared, config
+from theano import tensor, In, shared, config
 from theano.compat import exc_message
 from theano.printing import pp
 from theano.tensor.blas import (_dot22, _dot22scalar, res_is_a, _as_scalar,
@@ -25,6 +24,7 @@ from theano.tests import unittest_tools
 from .test_basic import (as_tensor_variable, inplace_func,
                         compile, inplace)
 import theano.tensor.blas_scipy
+from theano.tests.unittest_tools import attr
 
 
 if config.mode == 'FAST_COMPILE':
@@ -457,7 +457,7 @@ def just_gemm(i, o, ishapes=[(4, 3), (3, 5), (4, 5), (), ()],
               max_graphlen=0, expected_nb_gemm=1):
     try:
         f = inplace_func(
-                [Param(ii, mutable=True, allow_downcast=True) for ii in i],
+                [In(ii, mutable=True, allow_downcast=True) for ii in i],
                 o,
                 mode='FAST_RUN',
                 on_unused_input='ignore')
@@ -543,7 +543,7 @@ def test_gemm_opt_double_gemm():
     o = [(a * T.dot(X, Y)
         + gemm_inplace(Z, b, S.T, R.T, T.constant(1.0).astype(config.floatX)))]
     try:
-        f = inplace_func([Param(ii, mutable=True) for ii in i], o,
+        f = inplace_func([In(ii, mutable=True) for ii in i], o,
                 mode='FAST_RUN', on_unused_input='ignore')
         for node in f.maker.fgraph.apply_nodes:
             if isinstance(node.op, T.Dot):
